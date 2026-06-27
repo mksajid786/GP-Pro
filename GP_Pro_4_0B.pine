@@ -1,0 +1,728 @@
+//@version=6
+indicator("GP Pro 4.0B", shorttitle="GP Pro 4.0B", overlay=true, max_labels_count=300, max_lines_count=150, max_boxes_count=120)
+
+//══════════════════════════════════════════════
+// GP PRO 4.0A ARCHITECTURE
+// 1. Core Engine
+// 2. Trend Engine
+// 3. Structure Engine
+// 4. Momentum Engine
+// 5. Liquidity Engine
+// 6. Decision Engine
+// 7. Trade Engine
+// 8. Dashboard
+// 9. Alerts
+//══════════════════════════════════════════════
+
+
+
+//━━━━━━━━━━━━━━━━━━━
+// 4.0B WEIGHTED DECISION ENGINE
+//━━━━━━━━━━━━━━━━━━━
+TREND_WEIGHT      = 30
+STRUCTURE_WEIGHT  = 20
+MTF_WEIGHT        = 15
+LIQUIDITY_WEIGHT  = 10
+FVG_WEIGHT        = 10
+OB_WEIGHT         = 5
+VOLUME_WEIGHT     = 5
+RSI_WEIGHT        = 5
+
+f_weightedScore(trend, structure, mtf, liq, fvg, ob, vol, rsi)=>
+    trend*TREND_WEIGHT + structure*STRUCTURE_WEIGHT + mtf*MTF_WEIGHT + liq*LIQUIDITY_WEIGHT + fvg*FVG_WEIGHT + ob*OB_WEIGHT + vol*VOLUME_WEIGHT + rsi*RSI_WEIGHT
+
+//━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━
+ema20Len  = input.int(20, "EMA 20")
+ema50Len  = input.int(50, "EMA 50")
+ema200Len = input.int(200, "EMA 200")
+
+rsiLen = input.int(14, "RSI Length")
+atrLen = input.int(14, "ATR Length")
+volLen = input.int(20, "Volume MA")
+
+pivotLen = input.int(4, "Structure Pivot Length")
+cooldownBars = input.int(15, "Signal Cooldown Bars")
+structureCooldown = input.int(20, "BOS Label Cooldown")
+liquidityCooldown = input.int(12, "Liquidity Label Cooldown")
+
+showEMAs = input.bool(true, "Show EMAs")
+showDashboard = input.bool(true, "Show Dashboard")
+dashTextSize = input.string("Medium", "Dashboard Size", options=["Small", "Medium", "Large"])
+signalMode = input.string("Balanced", "Signal Strictness", options=["Conservative", "Balanced", "Aggressive"])
+showSignals = input.bool(true, "Show Signals")
+showBOS = input.bool(true, "Show BOS / CHoCH")
+showSwings = input.bool(false, "Show HH/HL/LH/LL")
+showLiquidity = input.bool(true, "Show Liquidity")
+showFVG = input.bool(true, "Show Nearest FVG Only")
+showOB = input.bool(true, "Show OB Zones")
+showPD = input.bool(true, "Show Equilibrium")
+
+maxFVGZones = input.int(5, "Max FVG Memory", minval=1, maxval=20)
+maxOBZones = input.int(4, "Max OB Memory", minval=1, maxval=20)
+
+sweepATR = input.float(0.15, "Sweep ATR Buffer", step=0.05)
+wickATR  = input.float(0.35, "Minimum Sweep Wick ATR", step=0.05)
+eqATR    = input.float(0.15, "Equal High/Low ATR Tolerance", step=0.05)
+
+fvgExtend = input.int(40, "FVG Extension Bars")
+obExtend = input.int(50, "OB Extension Bars")
+obExpireBars = input.int(80, "OB Expiry Bars", minval=20, maxval=300)
+
+slATR = input.float(1.2, "Trade Plan SL ATR", step=0.1)
+tp1RR = input.float(1.0, "TP1 RR", step=0.25)
+tp2RR = input.float(2.0, "TP2 RR", step=0.25)
+
+//━━━━━━━━━━━━━━━━━━━
+// UTILITY FUNCTIONS
+//━━━━━━━━━━━━━━━━━━━
+f_clamp(v, lo, hi)=> math.max(lo, math.min(hi, v))
+f_scoreColor(v)=> v>=90?color.rgb(0,160,90):v>=75?color.green:v>=60?color.rgb(220,170,35):v>=40?color.orange:color.red
+
+//━━━━━━━━━━━━━━━━━━━
+// CORE
+//━━━━━━━━━━━━━━━━━━━
+ema20 = ta.ema(close, ema20Len)
+ema50 = ta.ema(close, ema50Len)
+ema200 = ta.ema(close, ema200Len)
+
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+volMA = ta.sma(volume, volLen)
+
+strongVol = volume > volMA
+veryStrongVol = volume > volMA * 1.25
+bullMom = rsi > 55
+bearMom = rsi < 45
+
+//━━━━━━━━━━━━━━━━━━━
+// MTF TREND
+//━━━━━━━━━━━━━━━━━━━
+f_trend(tf) =>
+    c = request.security(syminfo.tickerid, tf, close)
+    e20 = request.security(syminfo.tickerid, tf, ta.ema(close, ema20Len))
+    e50 = request.security(syminfo.tickerid, tf, ta.ema(close, ema50Len))
+    c > e20 and e20 > e50 ? 1 : c < e20 and e20 < e50 ? -1 : 0
+
+trend15 = f_trend("15")
+trend1h = f_trend("60")
+trend4h = f_trend("240")
+
+localBull = close > ema20 and ema20 > ema50
+localBear = close < ema20 and ema20 < ema50
+
+strongBull = close > ema20 and ema20 > ema50 and ema50 > ema200
+strongBear = close < ema20 and ema20 < ema50 and ema50 < ema200
+
+mtfBull = trend15 == 1 and trend1h == 1 and trend4h == 1
+mtfBear = trend15 == -1 and trend1h == -1 and trend4h == -1
+
+ema20SlopeUp = ema20 > ema20[5]
+ema20SlopeDown = ema20 < ema20[5]
+ema50SlopeUp = ema50 > ema50[5]
+ema50SlopeDown = ema50 < ema50[5]
+
+//━━━━━━━━━━━━━━━━━━━
+// STRUCTURE
+//━━━━━━━━━━━━━━━━━━━
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastHigh = na
+var float prevHigh = na
+var float lastLow = na
+var float prevLow = na
+var int structureBias = 0
+var int lastStructureLabelBar = na
+
+if not na(ph)
+    prevHigh := lastHigh
+    lastHigh := ph
+    swingTxt = na(prevHigh) ? "SH" : lastHigh > prevHigh ? "HH" : "LH"
+    if showSwings
+        label.new(bar_index - pivotLen, ph, swingTxt, style=label.style_label_down, color=swingTxt == "HH" ? color.green : color.red, textcolor=color.white, size=size.tiny)
+
+if not na(pl)
+    prevLow := lastLow
+    lastLow := pl
+    swingTxt = na(prevLow) ? "SL" : lastLow > prevLow ? "HL" : "LL"
+    if showSwings
+        label.new(bar_index - pivotLen, pl, swingTxt, style=label.style_label_up, color=swingTxt == "HL" ? color.green : color.red, textcolor=color.white, size=size.tiny)
+
+bullBreak = not na(lastHigh) and close > lastHigh and close[1] <= lastHigh
+bearBreak = not na(lastLow) and close < lastLow and close[1] >= lastLow
+
+bosBull = bullBreak and structureBias == 1
+bosBear = bearBreak and structureBias == -1
+chochBull = bullBreak and structureBias == -1
+chochBear = bearBreak and structureBias == 1
+
+canPrintStructure = na(lastStructureLabelBar) or bar_index - lastStructureLabelBar > structureCooldown
+
+if bullBreak
+    if showBOS and (chochBull or canPrintStructure)
+        label.new(bar_index, high, chochBull ? "CHoCH ↑" : "BOS ↑", style=label.style_label_down, color=chochBull ? color.rgb(0, 180, 255) : color.green, textcolor=color.white, size=chochBull ? size.normal : size.small)
+        lastStructureLabelBar := bar_index
+    structureBias := 1
+
+if bearBreak
+    if showBOS and (chochBear or canPrintStructure)
+        label.new(bar_index, low, chochBear ? "CHoCH ↓" : "BOS ↓", style=label.style_label_up, color=chochBear ? color.orange : color.red, textcolor=color.white, size=chochBear ? size.normal : size.small)
+        lastStructureLabelBar := bar_index
+    structureBias := -1
+
+//━━━━━━━━━━━━━━━━━━━
+// LIQUIDITY
+//━━━━━━━━━━━━━━━━━━━
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+highestWick = high >= ta.highest(high, 10)
+lowestWick = low <= ta.lowest(low, 10)
+
+highSweep = not na(lastHigh) and high > lastHigh + atr * sweepATR and close < lastHigh and upperWick >= atr * wickATR and highestWick and veryStrongVol
+lowSweep  = not na(lastLow) and low < lastLow - atr * sweepATR and close > lastLow and lowerWick >= atr * wickATR and lowestWick and veryStrongVol
+
+eqHigh = not na(lastHigh) and not na(prevHigh) and math.abs(lastHigh - prevHigh) <= atr * eqATR
+eqLow  = not na(lastLow) and not na(prevLow) and math.abs(lastLow - prevLow) <= atr * eqATR
+
+var int lastLiquidityLabelBar = na
+canPrintLiq = na(lastLiquidityLabelBar) or bar_index - lastLiquidityLabelBar > liquidityCooldown
+
+if showLiquidity and highSweep and canPrintLiq
+    label.new(bar_index, high, "High Sweep ★", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    lastLiquidityLabelBar := bar_index
+
+if showLiquidity and lowSweep and canPrintLiq
+    label.new(bar_index, low, "Low Sweep ★", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+    lastLiquidityLabelBar := bar_index
+
+if showLiquidity and not na(ph) and eqHigh and canPrintLiq
+    label.new(bar_index - pivotLen, ph, "EQH", style=label.style_label_down, color=color.purple, textcolor=color.white, size=size.tiny)
+    lastLiquidityLabelBar := bar_index
+
+if showLiquidity and not na(pl) and eqLow and canPrintLiq
+    label.new(bar_index - pivotLen, pl, "EQL", style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.tiny)
+    lastLiquidityLabelBar := bar_index
+
+//━━━━━━━━━━━━━━━━━━━
+// ZONE MANAGER
+//━━━━━━━━━━━━━━━━━━━
+var box[] bullFVGBoxes = array.new_box()
+var box[] bearFVGBoxes = array.new_box()
+var box[] bullOBBoxes = array.new_box()
+var box[] bearOBBoxes = array.new_box()
+
+f_addBox(arr, bx, maxCount) =>
+    array.push(arr, bx)
+    if array.size(arr) > maxCount
+        old = array.shift(arr)
+        box.delete(old)
+
+f_cleanFilledFVG(arr, isBull) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            bx = array.get(arr, i)
+            top = box.get_top(bx)
+            bot = box.get_bottom(bx)
+            filled = isBull ? low <= bot : high >= top
+            if filled
+                box.delete(bx)
+                array.remove(arr, i)
+
+f_cleanInvalidOrExpiredOB(arr, isBull) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            bx = array.get(arr, i)
+            top = box.get_top(bx)
+            bot = box.get_bottom(bx)
+            invalid = isBull ? close < bot : close > top
+            expired = bar_index > box.get_right(bx)
+            if invalid or expired
+                box.delete(bx)
+                array.remove(arr, i)
+
+f_nearestBoxIndex(arr) =>
+    int nearest = na
+    float nearestDist = na
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            bx = array.get(arr, i)
+            mid = (box.get_top(bx) + box.get_bottom(bx)) / 2.0
+            dist = math.abs(close - mid)
+            if na(nearestDist) or dist < nearestDist
+                nearestDist := dist
+                nearest := i
+    nearest
+
+f_nearestBoxTop(arr, idx) =>
+    not na(idx) and array.size(arr) > idx ? box.get_top(array.get(arr, idx)) : na
+
+f_nearestBoxBot(arr, idx) =>
+    not na(idx) and array.size(arr) > idx ? box.get_bottom(array.get(arr, idx)) : na
+
+f_boxTouched(arr, idx) =>
+    bool touched = false
+    if not na(idx) and array.size(arr) > idx
+        bx = array.get(arr, idx)
+        top = box.get_top(bx)
+        bot = box.get_bottom(bx)
+        touched := low <= top and high >= bot
+    touched
+
+f_showOnlyNearest(arr, idx, visible, bgCol, brCol) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            bx = array.get(arr, i)
+            showBox = visible and not na(idx) and i == idx
+            box.set_bgcolor(bx, showBox ? bgCol : color.new(bgCol, 100))
+            box.set_border_color(bx, showBox ? brCol : color.new(brCol, 100))
+
+//━━━━━━━━━━━━━━━━━━━
+// FVG ENGINE
+//━━━━━━━━━━━━━━━━━━━
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+if bullFVG
+    bx = box.new(bar_index - 2, low, bar_index + fvgExtend, high[2], bgcolor=color.new(color.green, 93), border_color=color.new(color.green, 65))
+    f_addBox(bullFVGBoxes, bx, maxFVGZones)
+
+if bearFVG
+    bx = box.new(bar_index - 2, low[2], bar_index + fvgExtend, high, bgcolor=color.new(color.red, 93), border_color=color.new(color.red, 65))
+    f_addBox(bearFVGBoxes, bx, maxFVGZones)
+
+f_cleanFilledFVG(bullFVGBoxes, true)
+f_cleanFilledFVG(bearFVGBoxes, false)
+
+nearestBullFVG = f_nearestBoxIndex(bullFVGBoxes)
+nearestBearFVG = f_nearestBoxIndex(bearFVGBoxes)
+
+f_showOnlyNearest(bullFVGBoxes, nearestBullFVG, showFVG, color.new(color.green, 93), color.new(color.green, 65))
+f_showOnlyNearest(bearFVGBoxes, nearestBearFVG, showFVG, color.new(color.red, 93), color.new(color.red, 65))
+
+bullFVGActive = array.size(bullFVGBoxes) > 0
+bearFVGActive = array.size(bearFVGBoxes) > 0
+
+bullFVGTouch = f_boxTouched(bullFVGBoxes, nearestBullFVG)
+bearFVGTouch = f_boxTouched(bearFVGBoxes, nearestBearFVG)
+
+//━━━━━━━━━━━━━━━━━━━
+// ORDER BLOCK ENGINE
+//━━━━━━━━━━━━━━━━━━━
+lastBearHigh = ta.valuewhen(close < open, high, 0)
+lastBearLow  = ta.valuewhen(close < open, low, 0)
+lastBullHigh = ta.valuewhen(close > open, high, 0)
+lastBullLow  = ta.valuewhen(close > open, low, 0)
+
+newBullOB = (bosBull or chochBull) and not na(lastBearHigh)
+newBearOB = (bosBear or chochBear) and not na(lastBullHigh)
+
+if newBullOB
+    bx = box.new(bar_index - 5, lastBearHigh, bar_index + obExpireBars, lastBearLow, bgcolor=color.new(color.teal, 93), border_color=color.new(color.teal, 65))
+    f_addBox(bullOBBoxes, bx, maxOBZones)
+
+if newBearOB
+    bx = box.new(bar_index - 5, lastBullHigh, bar_index + obExpireBars, lastBullLow, bgcolor=color.new(color.maroon, 93), border_color=color.new(color.maroon, 65))
+    f_addBox(bearOBBoxes, bx, maxOBZones)
+
+f_cleanInvalidOrExpiredOB(bullOBBoxes, true)
+f_cleanInvalidOrExpiredOB(bearOBBoxes, false)
+
+nearestBullOB = f_nearestBoxIndex(bullOBBoxes)
+nearestBearOB = f_nearestBoxIndex(bearOBBoxes)
+
+f_showOnlyNearest(bullOBBoxes, nearestBullOB, showOB, color.new(color.teal, 93), color.new(color.teal, 65))
+f_showOnlyNearest(bearOBBoxes, nearestBearOB, showOB, color.new(color.maroon, 93), color.new(color.maroon, 65))
+
+bullOBActive = array.size(bullOBBoxes) > 0
+bearOBActive = array.size(bearOBBoxes) > 0
+bullOBTouch = f_boxTouched(bullOBBoxes, nearestBullOB)
+bearOBTouch = f_boxTouched(bearOBBoxes, nearestBearOB)
+
+//━━━━━━━━━━━━━━━━━━━
+// PREMIUM / DISCOUNT
+//━━━━━━━━━━━━━━━━━━━
+eq = not na(lastHigh) and not na(lastLow) ? (lastHigh + lastLow) / 2 : na
+premium = not na(eq) and close > eq
+discount = not na(eq) and close < eq
+
+plot(showPD ? eq : na, "Equilibrium", color=color.new(color.yellow, 35), style=plot.style_linebr)
+
+//━━━━━━━━━━━━━━━━━━━
+// GP Pro 3.7 WEIGHTED INSTITUTIONAL SCORE ENGINE
+//━━━━━━━━━━━━━━━━━━━
+mtfBullCount = (trend15 == 1 ? 1 : 0) + (trend1h == 1 ? 1 : 0) + (trend4h == 1 ? 1 : 0)
+mtfBearCount = (trend15 == -1 ? 1 : 0) + (trend1h == -1 ? 1 : 0) + (trend4h == -1 ? 1 : 0)
+
+bullFvgRelevant = bullFVGActive and (structureBias == 1 or mtfBullCount >= mtfBearCount)
+bearFvgRelevant = bearFVGActive and (structureBias == -1 or mtfBearCount >= mtfBullCount)
+bullObRelevant = bullOBActive and (structureBias == 1 or mtfBullCount >= mtfBearCount)
+bearObRelevant = bearOBActive and (structureBias == -1 or mtfBearCount >= mtfBullCount)
+
+bullTrendOk = strongBull or localBull or close > ema20
+bearTrendOk = strongBear or localBear or close < ema20
+bullZoneOk = bullOBTouch or bullFVGTouch or bullObRelevant or bullFvgRelevant
+bearZoneOk = bearOBTouch or bearFVGTouch or bearObRelevant or bearFvgRelevant
+bullContextOk = lowSweep or discount
+bearContextOk = highSweep or premium
+bullMomentumOk = bullMom or rsi > 50
+bearMomentumOk = bearMom or rsi < 50
+bullSlopeOk = ema20SlopeUp or ema50SlopeUp
+bearSlopeOk = ema20SlopeDown or ema50SlopeDown
+
+// 7-factor institutional checklist.
+// Trend, HTF, structure, zone, PD/liquidity, momentum, and volume.
+bullConf = (bullTrendOk ? 1 : 0) + (mtfBullCount >= 2 ? 1 : 0) + (structureBias == 1 ? 1 : 0) + (bullZoneOk ? 1 : 0) + (bullContextOk ? 1 : 0) + (bullMomentumOk ? 1 : 0) + (strongVol ? 1 : 0)
+bearConf = (bearTrendOk ? 1 : 0) + (mtfBearCount >= 2 ? 1 : 0) + (structureBias == -1 ? 1 : 0) + (bearZoneOk ? 1 : 0) + (bearContextOk ? 1 : 0) + (bearMomentumOk ? 1 : 0) + (strongVol ? 1 : 0)
+
+// GP Pro 4.0A weighted score model.
+// Target weights: Trend 25%, Structure 20%, MTF 20%, Liquidity 10%, OB 10%, FVG 10%, RSI 5%.
+// This keeps the score smoother and makes one weak factor less likely to flip the dashboard.
+bullWeighted = 0.0
+bearWeighted = 0.0
+
+// Trend = 25%. Alignment + slope + price position.
+bullWeighted += strongBull and bullSlopeOk ? 25 : strongBull ? 21 : localBull and bullSlopeOk ? 18 : localBull ? 14 : close > ema20 ? 8 : 0
+bearWeighted += strongBear and bearSlopeOk ? 25 : strongBear ? 21 : localBear and bearSlopeOk ? 18 : localBear ? 14 : close < ema20 ? 8 : 0
+
+// Structure = 20%.
+bullWeighted += structureBias == 1 ? 20 : chochBull ? 14 : bosBull ? 11 : 0
+bearWeighted += structureBias == -1 ? 20 : chochBear ? 14 : bosBear ? 11 : 0
+
+// MTF = 20% base + small HTF agreement boost.
+// GP Pro 4.0A gives stronger respect to 1H/4H alignment so higher-timeframe agreement is not under-scored.
+bullWeighted += mtfBullCount == 3 ? 20 : mtfBullCount == 2 ? 14 : mtfBullCount == 1 ? 6 : 0
+bearWeighted += mtfBearCount == 3 ? 20 : mtfBearCount == 2 ? 14 : mtfBearCount == 1 ? 6 : 0
+bullWeighted += trend1h == 1 and trend4h == 1 ? 6 : trend4h == 1 ? 3 : 0
+bearWeighted += trend1h == -1 and trend4h == -1 ? 6 : trend4h == -1 ? 3 : 0
+
+// Liquidity / Premium-Discount context = 10%.
+bullWeighted += lowSweep ? 10 : discount ? 7 : premium ? -6 : 0
+bearWeighted += highSweep ? 10 : premium ? 7 : discount ? -6 : 0
+
+// Order Block = 10%.
+bullWeighted += bullOBTouch ? 10 : bullObRelevant ? 6 : 0
+bearWeighted += bearOBTouch ? 10 : bearObRelevant ? 6 : 0
+
+// FVG = 10%.
+bullWeighted += bullFVGTouch ? 10 : bullFvgRelevant ? 6 : 0
+bearWeighted += bearFVGTouch ? 10 : bearFvgRelevant ? 6 : 0
+
+// RSI / momentum = 5%.
+bullWeighted += bullMom ? 5 : rsi > 50 ? 3 : bearMom ? -3 : 0
+bearWeighted += bearMom ? 5 : rsi < 50 ? 3 : bullMom ? -3 : 0
+
+// Small participation adjustment. Volume supports the score but does not dominate it.
+bullWeighted += veryStrongVol ? 3 : strongVol ? 2 : -1
+bearWeighted += veryStrongVol ? 3 : strongVol ? 2 : -1
+
+// Confluence boost creates separation, but reduced opposing penalty keeps the score stable.
+bullQualityRaw = bullWeighted + bullConf * 3.0 - bearWeighted * 0.14
+bearQualityRaw = bearWeighted + bearConf * 3.0 - bullWeighted * 0.14
+bullQuality = math.max(0.0, math.min(100.0, bullQualityRaw))
+bearQuality = math.max(0.0, math.min(100.0, bearQualityRaw))
+
+scoreGap = bullQuality - bearQuality
+dominantDir = scoreGap > 5 ? 1 : scoreGap < -5 ? -1 : 0
+activeConf = dominantDir == 1 ? bullConf : dominantDir == -1 ? bearConf : math.max(bullConf, bearConf)
+
+// 90+ only when the checklist is almost complete.
+scoreCapBase = activeConf >= 7 ? 96 : activeConf == 6 ? 90 : activeConf == 5 ? 86 : activeConf == 4 ? 78 : activeConf == 3 ? 66 : 55
+htfAgree = (dominantDir == 1 and trend1h == 1 and trend4h == 1) or (dominantDir == -1 and trend1h == -1 and trend4h == -1)
+coreAgree = (dominantDir == 1 and structureBias == 1 and (localBull or strongBull)) or (dominantDir == -1 and structureBias == -1 and (localBear or strongBear))
+contextAgree = (dominantDir == 1 and (discount or lowSweep)) or (dominantDir == -1 and (premium or highSweep))
+htfQualityBoost = htfAgree and coreAgree ? 6 : htfAgree ? 3 : 0
+contextQualityBoost = contextAgree and coreAgree ? 3 : 0
+scoreCap = math.min(98, scoreCapBase + htfQualityBoost + contextQualityBoost)
+dominantQuality = dominantDir == 1 ? bullQuality : dominantDir == -1 ? bearQuality : 50.0
+score = dominantDir == 0 ? 50 : math.round(math.min(dominantQuality + htfQualityBoost + contextQualityBoost, scoreCap))
+
+confluenceText = str.tostring(activeConf) + "/7"
+
+// GP Pro 4.0A confidence is tied directly to Score for a more objective dashboard grade.
+confidenceScore = score
+confidenceText = score >= 90 ? "A+" : score >= 80 ? "A" : score >= 70 ? "B+" : score >= 60 ? "B" : score >= 50 ? "C" : score >= 40 ? "D" : "F"
+
+//━━━━━━━━━━━━━━━━━━━
+// GP Pro 4.0A ACTION + SETUP ENGINE
+//━━━━━━━━━━━━━━━━━━━
+var int lastSignalBar = na
+canSignal = na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars
+
+bullStructureTrigger = bosBull or chochBull or lowSweep
+bearStructureTrigger = bosBear or chochBear or highSweep
+bullZoneTrigger = bullOBTouch or bullFVGTouch
+bearZoneTrigger = bearOBTouch or bearFVGTouch
+
+strictNeedVol = signalMode != "Aggressive"
+strictNeedMtf = signalMode == "Conservative" ? 3 : signalMode == "Balanced" ? 2 : 1
+triggerThreshold = signalMode == "Conservative" ? 86 : signalMode == "Balanced" ? 80 : 74
+waitThreshold = signalMode == "Conservative" ? 62 : signalMode == "Balanced" ? 55 : 50
+
+// BUY/SELL remain strict trigger signals.
+longConfluence = dominantDir == 1 and structureBias == 1 and (localBull or strongBull) and mtfBullCount >= strictNeedMtf and bullMomentumOk and (strongVol or not strictNeedVol) and not premium and bullStructureTrigger and bullZoneTrigger
+shortConfluence = dominantDir == -1 and structureBias == -1 and (localBear or strongBear) and mtfBearCount >= strictNeedMtf and bearMomentumOk and (strongVol or not strictNeedVol) and not discount and bearStructureTrigger and bearZoneTrigger
+
+buySignal = canSignal and score >= triggerThreshold and activeConf >= 6 and longConfluence
+sellSignal = canSignal and score >= triggerThreshold and activeConf >= 6 and shortConfluence
+
+if buySignal or sellSignal
+    lastSignalBar := bar_index
+
+// Action is more informative now.
+// NO TRADE is reserved for truly conflicting or directionless conditions.
+bullDirectional = dominantDir == 1 and score >= waitThreshold and activeConf >= 3 and (structureBias == 1 or localBull or mtfBullCount >= 2)
+bearDirectional = dominantDir == -1 and score >= waitThreshold and activeConf >= 3 and (structureBias == -1 or localBear or mtfBearCount >= 2)
+
+bullRetest = bullDirectional and (bullOBTouch or bullFVGTouch)
+bearRetest = bearDirectional and (bearOBTouch or bearFVGTouch)
+
+bullPlanReady = bullDirectional
+bearPlanReady = bearDirectional
+
+waitLong = not buySignal and bullPlanReady
+waitShort = not sellSignal and bearPlanReady
+
+signalSide = buySignal ? 1 : sellSignal ? -1 : 0
+planSideRaw = signalSide != 0 ? signalSide : waitLong ? 1 : waitShort ? -1 : 0
+noTrade = signalSide == 0 and planSideRaw == 0
+planSide = noTrade ? 0 : planSideRaw
+
+// TRADE PLAN
+//━━━━━━━━━━━━━━━━━━━
+bullOBTop = f_nearestBoxTop(bullOBBoxes, nearestBullOB)
+bullOBBot = f_nearestBoxBot(bullOBBoxes, nearestBullOB)
+bearOBTop = f_nearestBoxTop(bearOBBoxes, nearestBearOB)
+bearOBBot = f_nearestBoxBot(bearOBBoxes, nearestBearOB)
+
+bullFVGTop = f_nearestBoxTop(bullFVGBoxes, nearestBullFVG)
+bullFVGBot = f_nearestBoxBot(bullFVGBoxes, nearestBullFVG)
+bearFVGTop = f_nearestBoxTop(bearFVGBoxes, nearestBearFVG)
+bearFVGBot = f_nearestBoxBot(bearFVGBoxes, nearestBearFVG)
+
+bullEntryTop = not na(bullOBTop) ? bullOBTop : not na(bullFVGTop) ? bullFVGTop : close + atr * 0.15
+bullEntryBot = not na(bullOBBot) ? bullOBBot : not na(bullFVGBot) ? bullFVGBot : close - atr * 0.15
+bearEntryTop = not na(bearOBTop) ? bearOBTop : not na(bearFVGTop) ? bearFVGTop : close + atr * 0.15
+bearEntryBot = not na(bearOBBot) ? bearOBBot : not na(bearFVGBot) ? bearFVGBot : close - atr * 0.15
+
+entryMid = planSide == 1 ? (bullEntryTop + bullEntryBot) / 2 : planSide == -1 ? (bearEntryTop + bearEntryBot) / 2 : na
+stopLoss = planSide == 1 ? math.min(bullEntryBot, not na(lastLow) ? lastLow : bullEntryBot) - atr * slATR : planSide == -1 ? math.max(bearEntryTop, not na(lastHigh) ? lastHigh : bearEntryTop) + atr * slATR : na
+risk = not na(entryMid) and not na(stopLoss) ? math.abs(entryMid - stopLoss) : na
+tp1 = planSide == 1 ? entryMid + risk * tp1RR : planSide == -1 ? entryMid - risk * tp1RR : na
+tp2 = planSide == 1 ? entryMid + risk * tp2RR : planSide == -1 ? entryMid - risk * tp2RR : na
+rrText = planSide != 0 ? "1:" + str.tostring(tp2RR, "#.##") : "-"
+
+entryText = planSide == 1 ? "Buy Trigger\n" + str.tostring(bullEntryTop, format.mintick) : planSide == -1 ? "Sell Trigger\n" + str.tostring(bearEntryBot, format.mintick) : "-"
+slTpText = planSide != 0 ? str.tostring(stopLoss, format.mintick) + "\n→ " + str.tostring(tp1, format.mintick) : "-"
+tp2RrText = planSide != 0 ? str.tostring(tp2, format.mintick) + "\n" + rrText : "-"
+
+// Higher timeframes are better treated as planning zones, not exact execution entries.
+isHigherTF = timeframe.in_seconds(timeframe.period) >= 86400
+planRow1Name = isHigherTF ? "Trade Zone" : "Entry"
+planRow2Name = isHigherTF ? "Invalidation" : "SL → TP1"
+planRow3Name = isHigherTF ? "Target / RR" : "TP2 / RR"
+planRow2Text = isHigherTF and planSide != 0 ? str.tostring(stopLoss, format.mintick) : slTpText
+planRow3Text = isHigherTF and planSide != 0 ? str.tostring(tp2, format.mintick) + "\n" + rrText : tp2RrText
+
+//━━━━━━━━━━━━━━━━━━━
+//━━━━━━━━━━━━━━━━━━━
+// GPv3 TEXT ENGINE
+//━━━━━━━━━━━━━━━━━━━
+trendDistanceAtr = math.abs(close - ema200) / atr
+bullSlopeStrong = ema20SlopeUp and ema50SlopeUp and ema20 > ema20[3] and ema50 > ema50[3]
+bearSlopeStrong = ema20SlopeDown and ema50SlopeDown and ema20 < ema20[3] and ema50 < ema50[3]
+
+// GP Pro 4.0A trend headline uses EMA + slope + structure/HTF agreement.
+// This prevents Neutral from appearing when structure, bias, and HTF are clearly directional.
+trendCandidate = strongBull and bullSlopeStrong and mtfBullCount >= 2 and structureBias == 1 ? "Strong Bull" : strongBull and (ema20SlopeUp or mtfBullCount >= 2 or structureBias == 1) ? "Bull" : dominantDir == 1 and score >= 70 and (structureBias == 1 or mtfBullCount >= 2) ? "Bull" : dominantDir == 1 and score >= 55 ? "Weak Bull" : strongBear and bearSlopeStrong and mtfBearCount >= 2 and structureBias == -1 ? "Strong Bear" : strongBear and (ema20SlopeDown or mtfBearCount >= 2 or structureBias == -1) ? "Bear" : dominantDir == -1 and score >= 70 and (structureBias == -1 or mtfBearCount >= 2) ? "Bear" : dominantDir == -1 and score >= 55 ? "Weak Bear" : "Neutral"
+
+// Trend stability: require 2 consecutive bars before the headline trend changes.
+var string trendStrengthStable = "Neutral"
+var string pendingTrend = "Neutral"
+var int pendingTrendBars = 0
+if trendCandidate != trendStrengthStable
+    if trendCandidate == pendingTrend
+        pendingTrendBars += 1
+    else
+        pendingTrend := trendCandidate
+        pendingTrendBars := 1
+    if pendingTrendBars >= 2
+        trendStrengthStable := trendCandidate
+else
+    pendingTrend := trendCandidate
+    pendingTrendBars := 0
+
+trendStrength = trendStrengthStable
+
+// MTF traffic-light display. Each timeframe has its own clean line.
+mtf15Text = trend15 == 1 ? "🟢 15M" : trend15 == -1 ? "🔴 15M" : "🟡 15M"
+mtf1hText = trend1h == 1 ? "🟢 1H" : trend1h == -1 ? "🔴 1H" : "🟡 1H"
+mtf4hText = trend4h == 1 ? "🟢 4H" : trend4h == -1 ? "🔴 4H" : "🟡 4H"
+structureText = structureBias == 1 ? "Bullish" : structureBias == -1 ? "Bearish" : "Neutral"
+liquidityText = highSweep ? "High Sweep" : lowSweep ? "Low Sweep" : eqHigh ? "EQH" : eqLow ? "EQL" : "None"
+fvgBias = bullFvgRelevant and not bearFvgRelevant ? 1 : bearFvgRelevant and not bullFvgRelevant ? -1 : structureBias == 1 and bullFVGActive ? 1 : structureBias == -1 and bearFVGActive ? -1 : 0
+obBias = bullOBTouch ? 2 : bearOBTouch ? -2 : bullObRelevant and not bearObRelevant ? 1 : bearObRelevant and not bullObRelevant ? -1 : structureBias == 1 and bullOBActive ? 1 : structureBias == -1 and bearOBActive ? -1 : 0
+fvgText = fvgBias == 1 ? "Bullish" : fvgBias == -1 ? "Bearish" : "None"
+obText = obBias == 2 ? "Bull Retest" : obBias == -2 ? "Bear Retest" : obBias == 1 ? "Bullish" : obBias == -1 ? "Bearish" : "None"
+pdText = premium ? "Premium" : discount ? "Discount" : "EQ"
+
+biasText = dominantDir == 1 and score >= 82 ? "Strong Bull" : dominantDir == 1 and score >= 60 ? "Bull" : dominantDir == 1 ? "Weak Bull" : dominantDir == -1 and score >= 82 ? "Strong Bear" : dominantDir == -1 and score >= 60 ? "Bear" : dominantDir == -1 ? "Weak Bear" : "Neutral"
+biasDisplay = dominantDir == 1 ? "🟢 " + biasText : dominantDir == -1 ? "🔴 " + biasText : "🟡 Neutral"
+trendDisplay = trendStrength == "Strong Bull" or trendStrength == "Bull" or trendStrength == "Weak Bull" ? "🟢 " + trendStrength : trendStrength == "Strong Bear" or trendStrength == "Bear" or trendStrength == "Weak Bear" ? "🔴 " + trendStrength : "🟡 Neutral"
+confidenceStars = score >= 90 ? "★★★★★" : score >= 80 ? "★★★★☆" : score >= 70 ? "★★★★" : score >= 60 ? "★★★" : score >= 50 ? "★★☆" : score >= 40 ? "★★" : "★"
+confidenceDisplay = confidenceStars + " " + confidenceText
+
+bullNearBreak = waitLong and not na(bullEntryTop) and close >= bullEntryTop - atr * 0.20
+bearNearBreak = waitShort and not na(bearEntryBot) and close <= bearEntryBot + atr * 0.20
+bullAtZone = waitLong and (bullOBTouch or bullFVGTouch)
+bearAtZone = waitShort and (bearOBTouch or bearFVGTouch)
+
+// READY = high-quality alignment + price is near execution zone/trigger.
+// This prevents READY from appearing too early while price is still far from the actual entry area.
+readyLong = waitLong and activeConf >= 5 and score >= 75 and structureBias == 1 and mtfBullCount >= 2 and (bullAtZone or bullNearBreak)
+readyShort = waitShort and activeConf >= 5 and score >= 75 and structureBias == -1 and mtfBearCount >= 2 and (bearAtZone or bearNearBreak)
+
+bullNeedsRetest = waitLong and not readyLong and bullZoneOk and not bullAtZone
+bearNeedsRetest = waitShort and not readyShort and bearZoneOk and not bearAtZone
+bullNeedsBreakout = waitLong and not readyLong and not bullNeedsRetest and not bullStructureTrigger
+bearNeedsBreakout = waitShort and not readyShort and not bearNeedsRetest and not bearStructureTrigger
+bullNeedsConfirm = waitLong and not readyLong and not bullNeedsRetest and not bullNeedsBreakout and (not bullMomentumOk or (strictNeedVol and not strongVol))
+bearNeedsConfirm = waitShort and not readyShort and not bearNeedsRetest and not bearNeedsBreakout and (not bearMomentumOk or (strictNeedVol and not strongVol))
+
+actionText = buySignal or sellSignal ? "ENTER NOW" : readyLong or readyShort ? "READY" : bullNeedsRetest or bearNeedsRetest ? "WAIT RETEST" : bullNeedsBreakout or bearNeedsBreakout ? "WAIT BREAKOUT" : bullNeedsConfirm or bearNeedsConfirm ? "WAIT CONFIRM" : waitLong ? "WAIT BUY" : waitShort ? "WAIT SELL" : "NO TRADE"
+rsiText = bullMom ? "Bullish" : bearMom ? "Bearish" : "Neutral"
+volText = strongVol ? "Strong" : "Weak"
+setupText = buySignal or sellSignal ? "Triggered" : readyLong or readyShort ? "Ready" : bullNeedsRetest or bearNeedsRetest ? "Retest" : bullNeedsBreakout or bearNeedsBreakout ? "Breakout" : bullNeedsConfirm or bearNeedsConfirm ? "Confirmation" : waitLong or waitShort ? "Building" : activeConf >= 3 ? "Waiting" : "Invalid"
+// COLORS
+//━━━━━━━━━━━━━━━━━━━
+// Dashboard palette: calmer backgrounds, color only where it adds decision value.
+green = color.rgb(0, 135, 85)
+red = color.rgb(190, 45, 55)
+yellow = color.rgb(205, 150, 30)
+orange = color.rgb(205, 105, 25)
+purpleBg = color.rgb(115, 45, 140)
+cyan = color.rgb(0, 140, 195)
+
+labelBg = color.rgb(18, 21, 26)
+valueBg = color.rgb(46, 51, 58)
+mutedBg = color.rgb(65, 70, 78)
+headerBg = color.rgb(18, 72, 145)
+borderBg = color.rgb(95, 100, 110)
+
+trendIsBull = trendStrength == "Strong Bull" or trendStrength == "Bull" or trendStrength == "Weak Bull"
+trendIsBear = trendStrength == "Strong Bear" or trendStrength == "Bear" or trendStrength == "Weak Bear"
+
+// Analytical rows
+trendCol = trendIsBull ? green : trendIsBear ? red : valueBg
+mtfCol = valueBg
+structureCol = structureBias == 1 ? green : structureBias == -1 ? red : valueBg
+liqCol = lowSweep ? green : highSweep ? red : eqHigh or eqLow ? purpleBg : valueBg
+fvgCol = fvgBias == 1 ? green : fvgBias == -1 ? red : valueBg
+obCol = obBias == 2 or obBias == -2 ? orange : obBias == 1 ? green : obBias == -1 ? red : valueBg
+pdCol = discount ? green : premium ? red : valueBg
+rsiCol = bullMom ? green : bearMom ? red : valueBg
+volCol = strongVol ? green : valueBg
+
+// Decision rows
+scoreCol = score >= 90 ? color.rgb(0, 135, 120) : score >= 75 ? color.rgb(0, 115, 150) : score >= 60 ? color.rgb(185, 135, 35) : score >= 40 ? color.rgb(190, 95, 30) : red
+confluenceCol = activeConf >= 6 ? color.rgb(0, 120, 110) : activeConf >= 4 ? color.rgb(185, 135, 35) : valueBg
+confidenceCol = score >= 80 ? color.rgb(95, 65, 150) : score >= 60 ? color.rgb(110, 80, 140) : score >= 40 ? valueBg : mutedBg
+biasCol = dominantDir == 1 and score >= 60 ? green : dominantDir == -1 and score >= 60 ? red : valueBg
+actCol = actionText == "ENTER NOW" and planSide == 1 ? green : actionText == "ENTER NOW" and planSide == -1 ? red : actionText == "READY" and planSide == 1 ? green : actionText == "READY" and planSide == -1 ? red : actionText == "WAIT BREAKOUT" ? cyan : actionText == "WAIT RETEST" ? orange : actionText == "WAIT CONFIRM" ? yellow : actionText == "NO TRADE" ? mutedBg : valueBg
+setupCol = buySignal or sellSignal or setupText == "Ready" ? green : setupText == "Retest" or setupText == "Breakout" or setupText == "Confirmation" ? yellow : setupText == "Building" ? valueBg : mutedBg
+planCol = planSide == 1 ? green : planSide == -1 ? red : valueBg
+rrCol = planSide == 0 ? valueBg : tp2RR >= 2 ? green : tp2RR >= 1.5 ? yellow : red
+
+// PLOTS
+//━━━━━━━━━━━━━━━━━━━
+plot(showEMAs ? ema20 : na, "EMA 20", color=color.rgb(0, 170, 255), linewidth=2)
+plot(showEMAs ? ema50 : na, "EMA 50", color=color.orange, linewidth=2)
+plot(showEMAs ? ema200 : na, "EMA 200", color=color.gray, linewidth=2)
+
+plotshape(showSignals and buySignal, title="BUY", text="BUY", style=shape.labelup, location=location.belowbar, color=green, textcolor=color.white, size=size.small)
+plotshape(showSignals and sellSignal, title="SELL", text="SELL", style=shape.labeldown, location=location.abovebar, color=red, textcolor=color.white, size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━
+//━━━━━━━━━━━━━━━━━━━
+// DASHBOARD
+//━━━━━━━━━━━━━━━━━━━
+var table dash = table.new(position.top_right, 2, 25, border_width=2, frame_width=2, frame_color=borderBg, border_color=borderBg)
+
+// Merge header and MTF label cells once for a cleaner dashboard.
+if barstate.isfirst
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.merge_cells(dash, 0, 2, 0, 4)
+
+dashSize = dashTextSize == "Large" ? size.large : dashTextSize == "Medium" ? size.normal : size.small
+
+f_row(row, name, value, bg) =>
+    table.cell(dash, 0, row, name, text_color=color.white, bgcolor=labelBg, text_size=dashSize)
+    table.cell(dash, 1, row, value, text_color=color.white, bgcolor=bg, text_size=dashSize)
+
+f_sep(row) =>
+    table.cell(dash, 0, row, "────────", text_color=mutedBg, bgcolor=labelBg, text_size=size.tiny)
+    table.cell(dash, 1, row, "────────", text_color=mutedBg, bgcolor=valueBg, text_size=size.tiny)
+
+f_mtf_value(row, value) =>
+    table.cell(dash, 1, row, value, text_color=color.white, bgcolor=valueBg, text_size=dashSize, text_halign=text.align_center)
+
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "GP Pro 4.0A", text_color=color.white, bgcolor=headerBg, text_size=dashSize, text_halign=text.align_center)
+
+    f_row(1, "Trend", trendDisplay, trendCol)
+
+    // MTF block: one merged label cell + three clean traffic-light rows.
+    table.cell(dash, 0, 2, "MTF", text_color=color.white, bgcolor=labelBg, text_size=dashSize, text_halign=text.align_center, text_valign=text.align_center)
+    f_mtf_value(2, mtf15Text)
+    f_mtf_value(3, mtf1hText)
+    f_mtf_value(4, mtf4hText)
+
+    f_sep(5)
+
+    f_row(6, "Structure", structureText, structureCol)
+    f_row(7, "Liquidity", liquidityText, liqCol)
+    f_row(8, "FVG", fvgText, fvgCol)
+    f_row(9, "OB", obText, obCol)
+    f_row(10, "P/D", pdText, pdCol)
+
+    f_sep(11)
+
+    f_row(12, "RSI", str.tostring(rsi, "#") + " " + rsiText, rsiCol)
+    f_row(13, "Volume", volText, volCol)
+    f_row(14, "Score", str.tostring(score, "#"), scoreCol)
+    f_row(15, "Confluence", confluenceText, confluenceCol)
+    f_row(16, "Confidence", confidenceDisplay, confidenceCol)
+
+    f_sep(17)
+
+    f_row(18, "Bias", biasDisplay, biasCol)
+    f_row(19, "Action", actionText, actCol)
+    f_row(20, "Setup", setupText, setupCol)
+
+    f_sep(21)
+
+    f_row(22, planRow1Name, entryText, planCol)
+    f_row(23, planRow2Name, planRow2Text, planCol)
+    f_row(24, planRow3Name, planRow3Text, rrCol)
+
+// ALERTS
+//━━━━━━━━━━━━━━━━━━━
+alertcondition(buySignal, "GP Pro BUY", "GP Pro: BUY signal")
+alertcondition(sellSignal, "GP Pro SELL", "GP Pro: SELL signal")
+alertcondition(noTrade, "GP Pro NO TRADE", "GP Pro: NO TRADE state")
+alertcondition(waitLong, "GP Pro WAIT BUY", "GP Pro: WAIT BUY setup")
+alertcondition(waitShort, "GP Pro WAIT SELL", "GP Pro: WAIT SELL setup")
+alertcondition(readyLong, "GP Pro READY BUY", "GP Pro: READY BUY setup")
+alertcondition(readyShort, "GP Pro READY SELL", "GP Pro: READY SELL setup")
+alertcondition(highSweep, "High Sweep", "GP Pro: High liquidity sweep")
+alertcondition(lowSweep, "Low Sweep", "GP Pro: Low liquidity sweep")
+alertcondition(bullFVG, "Bullish FVG", "GP Pro: Bullish FVG")
+alertcondition(bearFVG, "Bearish FVG", "GP Pro: Bearish FVG")
+alertcondition(bullOBTouch, "Bullish OB Touch", "GP Pro: Bullish OB touched")
+alertcondition(bearOBTouch, "Bearish OB Touch", "GP Pro: Bearish OB touched")
+alertcondition(bosBull, "Bullish BOS", "GP Pro: Bullish BOS")
+alertcondition(bosBear, "Bearish BOS", "GP Pro: Bearish BOS")
+alertcondition(chochBull, "Bullish CHoCH", "GP Pro: Bullish CHoCH")
+alertcondition(chochBear, "Bearish CHoCH", "GP Pro: Bearish CHoCH")
